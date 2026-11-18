@@ -9,6 +9,7 @@ ffmpeg режет. Самые "громкие" моменты (крики, ха�
   python3 stream_clipper.py "https://www.youtube.com/live/qSyo5d-dVzA" --start 30:00 --end 32:00
   python3 stream_clipper.py video.mp4 --count 8 --min 10 --max 15
   python3 stream_clipper.py video.mp4 --at 1:02:10 --at 1:05:40   # вручную по таймкодам
+  python3 stream_clipper.py "https://www.youtube.com/live/ID" --live   # режет эфир на ходу
 """
 import argparse
 import array
@@ -123,6 +124,107 @@ def cut(src, start, length, dst, vertical):
     subprocess.run(cmd, check=True)
 
 
+def stream_url(source):
+    """Прямая ссылка на поток (HLS) для живого эфира."""
+    if os.path.exists(source):
+        return source, True
+    r = subprocess.run([sys.executable, "-m", "yt_dlp", "-g", "-f",
+                        "b[height<=1080]/b", source],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        sys.exit("Не удалось получить поток: " + r.stderr.strip()[-500:])
+    return r.stdout.strip().splitlines()[0], False
+
+
+def live_mode(a):
+    """Смотрит эфир в реальном времени и режет клипы по ходу.
+
+    Хранится только последняя минута-полторы в виде кусков по 2 сек,
+    старые куски удаляются, поэтому весь стрим на диск не пишется.
+    """
+    import time
+    length = (a.min + a.max) / 2
+    pre, post = 0.6 * length, 0.4 * length
+    buf = os.path.join(a.out, "_live_buffer")
+    os.makedirs(buf, exist_ok=True)
+    for f in os.listdir(buf):
+        os.remove(os.path.join(buf, f))
+    url, is_file = stream_url(a.source)
+    seg_list = os.path.join(buf, "list.csv")
+    cmd = ["ffmpeg", "-v", "error", "-y"]
+    if is_file:
+        cmd.append("-re")  # тест: читать файл со скоростью эфира
+    cmd += ["-i", url, "-map", "0:v:0", "-map", "0:a:0", "-c", "copy",
+            "-f", "segment", "-segment_time", "2", "-reset_timestamps", "1",
+            "-segment_format", "mpegts", "-segment_list", seg_list,
+            "-segment_list_type", "csv", os.path.join(buf, "seg%06d.ts")]
+    rec = subprocess.Popen(cmd)
+    print("Смотрю эфир... Ctrl+C — остановить.")
+
+    segs = []        # (start, end, path)
+    timeline = []    # (time_sec, dB)
+    read_lines = 0
+    pending = None   # время пика, ждём хвост
+    last_end = -1e9
+    made = 0
+    try:
+        while True:
+            alive = rec.poll() is None
+            lines = open(seg_list).read().splitlines() if os.path.exists(seg_list) else []
+            for line in lines[read_lines:]:
+                name, s0, e0 = line.rsplit(",", 2)
+                path = os.path.join(buf, name)
+                s0, e0 = float(s0), float(e0)
+                segs.append((s0, e0, path))
+                for i, db in enumerate(loudness_per_second(path)):
+                    timeline.append((s0 + i, db))
+            read_lines = len(lines)
+            now = segs[-1][1] if segs else 0
+
+            # поиск пика: заметно громче фона последних 2 минут
+            if pending is None and len(timeline) > 20:
+                recent = sorted(db for t, db in timeline if t > now - 120)
+                base = recent[len(recent) // 2]
+                for t, db in timeline:
+                    if t < now - 6 or t < last_end + a.cooldown:
+                        continue
+                    if db > base + a.sensitivity and db > -30:
+                        pending = t
+                        print(f"Пик {fmt(t)}: {db:.1f} дБ (фон {base:.1f})")
+                        break
+
+            # пик найден и хвост уже записан -> режем клип
+            if pending is not None and now >= pending + post:
+                start = max(segs[0][0], pending - pre)
+                parts = [p for s0, e0, p in segs if e0 > start and s0 < start + length]
+                first = next(s0 for s0, e0, p in segs if e0 > start)
+                concat = "concat:" + "|".join(parts)
+                made += 1
+                dst = os.path.join(a.out, f"live_{made:02d}_{fmt(start).replace(':', '-')}.mp4")
+                cut(concat, start - first, length, dst, not a.horizontal)
+                print(f"[{made}] клип {fmt(start)}–{fmt(start + length)} -> {dst}", flush=True)
+                last_end, pending = start + length, None
+                if a.count_live and made >= a.count_live:
+                    break
+
+            # удаляем старые куски
+            keep_from = now - max(a.buffer, length + 10)
+            while segs and segs[0][1] < keep_from:
+                os.remove(segs.pop(0)[2])
+            timeline = [x for x in timeline if x[0] > now - 180]
+
+            if not alive:
+                break
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if rec.poll() is None:
+            rec.terminate()
+        shutil.rmtree(buf, ignore_errors=True)
+    print(f"Эфир: сохранено {made} клипов в {a.out}/")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Нарезка стрима на короткие клипы")
     ap.add_argument("source", help="ссылка YouTube/Twitch или путь к файлу")
@@ -136,6 +238,16 @@ def main():
     ap.add_argument("--horizontal", action="store_true",
                     help="оставить 16:9 (по умолчанию 9:16 для Shorts/TikTok/Reels)")
     ap.add_argument("--out", default="clips", help="папка для клипов")
+    ap.add_argument("--live", action="store_true",
+                    help="живой режим: резать идущий эфир по ходу, не скачивая целиком")
+    ap.add_argument("--sensitivity", type=float, default=8,
+                    help="живой режим: на сколько дБ громче фона = пик (меньше -> больше клипов)")
+    ap.add_argument("--cooldown", type=float, default=20,
+                    help="живой режим: мин. пауза между клипами, сек")
+    ap.add_argument("--buffer", type=float, default=90,
+                    help="живой режим: сколько секунд эфира держать в памяти")
+    ap.add_argument("--count-live", type=int, default=0,
+                    help="живой режим: остановиться после N клипов (0 = до конца эфира)")
     a = ap.parse_args()
 
     need("ffmpeg"), need("ffprobe")
@@ -143,6 +255,8 @@ def main():
         sys.exit("--min не может быть больше --max")
     length = (a.min + a.max) / 2
     os.makedirs(a.out, exist_ok=True)
+    if a.live:
+        return live_mode(a)
     start, end = parse_time(a.start), parse_time(a.end)
 
     if os.path.exists(a.source):
