@@ -32,6 +32,16 @@ def probe_duration(path):
     return float(r.stdout.strip())
 
 
+def stream_start(path, kind):
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", f"{kind}:0",
+                        "-show_entries", "stream=start_time", "-of", "default=nw=1:nk=1", path],
+                       capture_output=True, text=True)
+    try:
+        return float(r.stdout.strip().splitlines()[0])
+    except (ValueError, IndexError):
+        return 0.0
+
+
 def esc(text):
     """Экранирование текста для drawtext."""
     return (text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\u2019")
@@ -133,14 +143,16 @@ def main():
         draws += text_block(font, a.brand, 60, 40, 40, "white")
     parts.append(f"[{last}]" + ",".join(draws) + "[v]")
 
-    sh = a.audio_shift
+    # если видео в клипе начинается позже звука (ждёт ключевой кадр), видео
+    # сдвигается к нулю — звук нужно сдвинуть на столько же, иначе он отстаёт
+    sh = a.audio_shift - max(0.0, stream_start(a.clip, "v") - stream_start(a.clip, "a"))
     if sh < 0:
         fix = f"atrim=start={-sh:.3f},asetpts=PTS-STARTPTS,"
     elif sh > 0:
         fix = f"adelay={int(sh * 1000)}:all=1,"
     else:
         fix = ""
-    fix = "aresample=async=1:first_pts=0," + fix
+    fix = "asetpts=PTS-STARTPTS," + fix
     if a.voice:
         parts.append(f"[0:a]{fix}atrim=0:{clip_len:.2f},volume={a.clip_volume},apad[ca]")
         parts.append("[1:a]volume=1.0,apad[va]")

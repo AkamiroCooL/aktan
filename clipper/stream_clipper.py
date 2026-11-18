@@ -117,7 +117,13 @@ def cut(src, start, length, dst, vertical):
                 "[0:v]scale=1080:-2[fg];"
                 "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[v]")
         vf = ["-filter_complex", filt, "-map", "[v]", "-map", "0:a?"]
-    cmd = ["ffmpeg", "-v", "error", "-y", "-ss", f"{start:.2f}", "-i", src,
+    if src.startswith("concat:"):
+        # куски эфира: декодируем с начала и режем точно, иначе видео ждёт
+        # ключевой кадр и начинается позже звука
+        seek = ["-i", src, "-ss", f"{start:.3f}"]
+    else:
+        seek = ["-ss", f"{start:.3f}", "-i", src]
+    cmd = ["ffmpeg", "-v", "error", "-y", *seek,
            "-t", f"{length:.2f}", *vf, "-af", "aresample=async=1",
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
            "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", dst]
@@ -188,6 +194,8 @@ def live_mode(a):
                 name, s0, e0 = line.rsplit(",", 2)
                 path = os.path.join(buf, name)
                 s0, e0 = float(s0), float(e0)
+                if e0 - s0 > 30:  # битая запись (абсолютное время эфира) — пропускаем
+                    continue
                 if t_origin is None:
                     t_origin = s0  # время от начала нарезки
                 s0, e0 = s0 - t_origin, e0 - t_origin
