@@ -118,22 +118,28 @@ def cut(src, start, length, dst, vertical):
                 "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[v]")
         vf = ["-filter_complex", filt, "-map", "[v]", "-map", "0:a?"]
     cmd = ["ffmpeg", "-v", "error", "-y", "-ss", f"{start:.2f}", "-i", src,
-           "-t", f"{length:.2f}", *vf,
+           "-t", f"{length:.2f}", *vf, "-af", "aresample=async=1",
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
            "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", dst]
     subprocess.run(cmd, check=True)
 
 
 def stream_url(source):
-    """Прямая ссылка на поток (HLS) для живого эфира."""
+    """Прямые ссылки на поток эфира: [общий] или [видео, звук].
+
+    YouTube часто отдаёт эфир раздельными потоками видео и звука.
+    Локальный файл (для теста) — путь, или "видео::звук".
+    """
     if os.path.exists(source):
-        return source, True
+        return [source], True
+    if "::" in source and all(os.path.exists(x) for x in source.split("::")):
+        return source.split("::"), True
     r = subprocess.run([sys.executable, "-m", "yt_dlp", "-g", "-f",
-                        "b[height<=1080]/b", source],
+                        "bv*[height<=1080]+ba/b[height<=1080]/b", source],
                        capture_output=True, text=True)
     if r.returncode != 0 or not r.stdout.strip():
         sys.exit("Не удалось получить поток: " + r.stderr.strip()[-500:])
-    return r.stdout.strip().splitlines()[0], False
+    return r.stdout.strip().splitlines()[:2], False
 
 
 def live_mode(a):
@@ -149,13 +155,19 @@ def live_mode(a):
     os.makedirs(buf, exist_ok=True)
     for f in os.listdir(buf):
         os.remove(os.path.join(buf, f))
-    url, is_file = stream_url(a.source)
+    urls, is_file = stream_url(a.source)
     seg_list = os.path.join(buf, "list.csv")
     cmd = ["ffmpeg", "-v", "error", "-y"]
-    if is_file:
-        cmd.append("-re")  # тест: читать файл со скоростью эфира
-    cmd += ["-i", url, "-map", "0:v:0", "-map", "0:a:0", "-c", "copy",
-            "-f", "segment", "-segment_time", "2", "-reset_timestamps", "1",
+    for u in urls:
+        if is_file:
+            cmd.append("-re")  # тест: читать файл со скоростью эфира
+        cmd += ["-i", u]
+    audio_in = 1 if len(urls) > 1 else 0
+    # -copyts: сохраняем исходные метки времени эфира. У видео и звука они общие,
+    # поэтому даже если потоки подключились в разные моменты, звук не съедет.
+    # Без -reset_timestamps куски идут непрерывно и склеиваются без рывков.
+    cmd += ["-map", "0:v:0", "-map", f"{audio_in}:a:0", "-c", "copy", "-copyts",
+            "-f", "segment", "-segment_time", "2",
             "-segment_format", "mpegts", "-segment_list", seg_list,
             "-segment_list_type", "csv", os.path.join(buf, "seg%06d.ts")]
     rec = subprocess.Popen(cmd)
@@ -164,6 +176,7 @@ def live_mode(a):
     segs = []        # (start, end, path)
     timeline = []    # (time_sec, dB)
     read_lines = 0
+    t_origin = None
     pending = None   # время пика, ждём хвост
     last_end = -1e9
     made = 0
@@ -175,6 +188,9 @@ def live_mode(a):
                 name, s0, e0 = line.rsplit(",", 2)
                 path = os.path.join(buf, name)
                 s0, e0 = float(s0), float(e0)
+                if t_origin is None:
+                    t_origin = s0  # время от начала нарезки
+                s0, e0 = s0 - t_origin, e0 - t_origin
                 segs.append((s0, e0, path))
                 for i, db in enumerate(loudness_per_second(path)):
                     timeline.append((s0 + i, db))

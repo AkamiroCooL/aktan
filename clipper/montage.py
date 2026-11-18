@@ -73,6 +73,8 @@ def main():
     ap.add_argument("--brand", default="", help="название твоего канала (вотермарк)")
     ap.add_argument("--clip-volume", type=float, default=0.35,
                     help="громкость оригинала под озвучкой (0..1)")
+    ap.add_argument("--audio-shift", type=float, default=0.0,
+                    help="сдвиг звука клипа, сек: -0.3 = звук раньше (если в исходнике звук отстаёт)")
     ap.add_argument("--font", help="путь к .ttf шрифту с кириллицей")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
@@ -131,12 +133,20 @@ def main():
         draws += text_block(font, a.brand, 60, 40, 40, "white")
     parts.append(f"[{last}]" + ",".join(draws) + "[v]")
 
+    sh = a.audio_shift
+    if sh < 0:
+        fix = f"atrim=start={-sh:.3f},asetpts=PTS-STARTPTS,"
+    elif sh > 0:
+        fix = f"adelay={int(sh * 1000)}:all=1,"
+    else:
+        fix = ""
+    fix = "aresample=async=1:first_pts=0," + fix
     if a.voice:
-        parts.append(f"[0:a]atrim=0:{clip_len:.2f},volume={a.clip_volume},apad[ca]")
+        parts.append(f"[0:a]{fix}atrim=0:{clip_len:.2f},volume={a.clip_volume},apad[ca]")
         parts.append("[1:a]volume=1.0,apad[va]")
         parts.append(f"[ca][va]amix=inputs=2:duration=longest:normalize=0,atrim=0:{total:.2f}[a]")
     else:
-        parts.append(f"[0:a]atrim=0:{clip_len:.2f},apad,atrim=0:{total:.2f}[a]")
+        parts.append(f"[0:a]{fix}atrim=0:{clip_len:.2f},apad,atrim=0:{total:.2f}[a]")
 
     cmd = ["ffmpeg", "-v", "error", "-y", *inputs, "-filter_complex", ";".join(parts),
            "-map", "[v]", "-map", "[a]", "-t", f"{total:.2f}", "-r", "30",
