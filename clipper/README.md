@@ -28,6 +28,17 @@ python3 clipper/stream_clipper.py stream.mp4 --count 8
 python3 clipper/stream_clipper.py stream.mp4 --at 1:02:10 --at 1:05:40
 ```
 
+## Поиск лучших моментов (что хотят увидеть зрители)
+
+```bash
+python3 clipper/find_moments.py "https://www.youtube.com/watch?v=qSyo5d-dVzA" --top 25
+```
+
+Видео не скачивается. Скрипт собирает три сигнала: «самые пересматриваемые» места
+(график YouTube), всплески чата трансляции (и о чём пишут) и таймкоды из комментариев.
+Результат — `moments/moments.md`: время, почему момент интересен, слова из чата.
+Дальше нужные моменты режутся через `stream_clipper.py --start ... --end ...`.
+
 ## Живой режим — нарезка прямо во время эфира
 
 ```bash
